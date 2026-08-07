@@ -53,6 +53,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util.dt import get_age, now
 
 from .bermuda_device import BermudaDevice
+from .bermuda_findmy import BermudaFindMyManager
 from .bermuda_irk import BermudaIrkManager
 from .const import (
     _LOGGER,
@@ -70,6 +71,7 @@ from .const import (
     CONF_RSSI_OFFSETS,
     CONF_SMOOTHING_SAMPLES,
     CONF_UPDATE_INTERVAL,
+    CONFDATA_FINDMY,
     DEFAULT_ATTENUATION,
     DEFAULT_DEVTRACK_TIMEOUT,
     DEFAULT_MAX_RADIUS,
@@ -80,6 +82,7 @@ from .const import (
     DOMAIN,
     DOMAIN_PRIVATE_BLE_DEVICE,
     METADEVICE_IBEACON_DEVICE,
+    METADEVICE_TYPE_FINDMY_SOURCE,
     METADEVICE_TYPE_IBEACON_SOURCE,
     METADEVICE_TYPE_PRIVATE_BLE_SOURCE,
     PRUNE_MAX_COUNT,
@@ -189,6 +192,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self._scanner_list: set[str] = set()
         self._scanners: set[BermudaDevice] = set()  # Set of all in self.devices that is_scanner=True
         self.irk_manager = BermudaIrkManager()
+        self.findmy_manager = BermudaFindMyManager()
+        self.findmy_manager.load(entry.data.get(CONFDATA_FINDMY, []))
+        # Guards against launching overlapping table rebuilds in the executor.
+        self._findmy_rebuild_running: bool = False
+        self._findmy_alignment_dirty: bool = False
 
         self.ar = ar.async_get(self.hass)
         self.er = er.async_get(self.hass)
@@ -659,6 +667,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         try:  # so we can still clean up update_in_progress
             nowstamp = monotonic_time_coarse()
 
+            # Keep the FindMy address table current before consuming adverts, so a
+            # rotation is matched on the first advert of the new MAC rather than
+            # after the next cycle.
+            self._async_refresh_findmy_table()
+
             # The main "get all adverts from the backend" part.
             result_gather_adverts = self._async_gather_advert_data()
 
@@ -710,6 +723,9 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         # Note that the below should be OK thread-wise, debugger indicates this is being
                         # called by _run in events.py, so pretty sure we are "in the event loop".
                         async_dispatcher_send(self.hass, SIGNAL_DEVICE_NEW, address)
+
+            # Persist any FindMy alignment we learned this cycle.
+            self.async_save_findmy_alignment()
 
             # Device Pruning (only runs periodically)
             self.prune_devices()
@@ -767,6 +783,12 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
                 device = self._get_or_create_device(bledevice.address)
                 device.process_advertisement(scanner_device, advertisementdata)
+
+                # FindMy accessories rotate their MAC on a key schedule, so we check
+                # each address against the precomputed table of addresses our
+                # configured accessories could currently be using.
+                if findmy_match := self.findmy_manager.check_mac(device.address):
+                    self.register_findmy_source(device, findmy_match)
 
         # end of for ha_scanner loop
         return True
@@ -1031,6 +1053,86 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                 "No address available for PB Device %s",
                                 pb_entity.entity_id,
                             )
+
+    def register_findmy_source(self, source_device: BermudaDevice, match) -> None:
+        """
+        Create or update the meta-device tracking a FindMy accessory.
+
+        Called each time an advertisement arrives from an address that matches one
+        of our configured accessories' key schedules. That happens on every advert,
+        not just on rotation, so this must stay cheap for the already-known case.
+        """
+        metadevice = self._get_or_create_device(match.accessory_id)
+
+        if len(metadevice.metadevice_sources) == 0:
+            # ##### NEW METADEVICE #####
+            if metadevice.address not in self.metadevices:
+                self.metadevices[metadevice.address] = metadevice
+            accessory = self.findmy_manager.accessories.get(match.accessory_id)
+            if accessory is not None:
+                metadevice.name_bt_local_name = metadevice.name_bt_local_name or accessory.friendly_name
+                metadevice.make_name()
+            # The user explicitly configured this accessory, so always give it sensors.
+            metadevice.create_sensor = True
+
+        source_device.metadevice_type.add(METADEVICE_TYPE_FINDMY_SOURCE)
+
+        if source_device.address not in metadevice.metadevice_sources:
+            # A new MAC for this accessory - most recent goes first, matching the
+            # convention pruning relies on.
+            metadevice.metadevice_sources.insert(0, source_device.address)
+            _LOGGER.debug(
+                "FindMy %s rotated to %s (index %d)",
+                metadevice.name,
+                source_device.address,
+                match.index,
+            )
+
+        # Record the sighting so the accessory's search window collapses to the
+        # indices around where it actually is.
+        if self.findmy_manager.note_sighting(match):
+            self._findmy_alignment_dirty = True
+
+    def _async_refresh_findmy_table(self) -> None:
+        """
+        Rebuild the FindMy MAC lookup table if it has aged out.
+
+        A cold build (an accessory we have never sighted, so a 30 day search window)
+        costs seconds of CPU, so it always goes to an executor. Once alignment is
+        established the window is a handful of indices and it is trivial, but we
+        keep it off the loop regardless for predictability.
+        """
+        if self._findmy_rebuild_running or not self.findmy_manager.accessories:
+            return
+        if not self.findmy_manager.needs_refresh():
+            return
+
+        self._findmy_rebuild_running = True
+
+        async def _rebuild() -> None:
+            try:
+                await self.hass.async_add_executor_job(self.findmy_manager.build_table)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to rebuild FindMy MAC table")
+            finally:
+                self._findmy_rebuild_running = False
+
+        self.config_entry.async_create_background_task(self.hass, _rebuild(), "Bermuda FindMy table rebuild")
+
+    def async_save_findmy_alignment(self) -> None:
+        """
+        Persist updated accessory alignment into the config entry.
+
+        Alignment is what keeps the search window small, so losing it on restart
+        means paying the expensive cold build again.
+        """
+        if not self._findmy_alignment_dirty:
+            return
+        self._findmy_alignment_dirty = False
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            data={**self.config_entry.data, CONFDATA_FINDMY: self.findmy_manager.dump()},
+        )
 
     def register_ibeacon_source(self, source_device: BermudaDevice):
         """

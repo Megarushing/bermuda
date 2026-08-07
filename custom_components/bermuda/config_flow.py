@@ -18,9 +18,13 @@ from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
 )
 
+from .bermuda_findmy import FindMyAccessoryKeys, FindMyKeyError
 from .const import (
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_IBEACON,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
     BDADDR_TYPE_RANDOM_RESOLVABLE,
@@ -36,6 +40,7 @@ from .const import (
     CONF_SCANNERS,
     CONF_SMOOTHING_SAMPLES,
     CONF_UPDATE_INTERVAL,
+    CONFDATA_FINDMY,
     DEFAULT_ATTENUATION,
     DEFAULT_DEVTRACK_TIMEOUT,
     DEFAULT_MAX_RADIUS,
@@ -188,6 +193,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             menu_options={
                 "globalopts": "Global Options",
                 "selectdevices": "Select Devices",
+                "findmy": "FindMy Accessories (AirTags)",
                 "calibration1_global": "Calibration 1: Global",
                 "calibration2_scanners": "Calibration 2: Scanner RSSI Offsets",
             },
@@ -258,6 +264,9 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 continue
             if device.address_type == ADDR_TYPE_PRIVATE_BLE_DEVICE:
                 # Private BLE Devices get configured automagically, skip
+                continue
+            if device.address_type == ADDR_TYPE_FINDMY:
+                # FindMy accessories have their own menu, and are always tracked.
                 continue
             if device.address_type == ADDR_TYPE_IBEACON:
                 # This is an iBeacon meta-device
@@ -579,6 +588,140 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 return self.coordinator.devices[device_address.lower()]
         # We couldn't match the HA device id to a bermuda device mac.
         return None
+
+    async def async_step_findmy(self, user_input=None):
+        """
+        Manage FindMy accessories (AirTags and licensed third-party tags).
+
+        These can't be picked from the discovered-devices list: they rotate their
+        MAC every 15 minutes, so there is no stable address to select. Instead the
+        user supplies the accessory's key material, and we derive the addresses.
+        """
+        coordinator = self.config_entry.runtime_data.coordinator
+        accessories = coordinator.findmy_manager.accessories
+
+        if user_input is not None:
+            if user_input.get("action") == "add":
+                return await self.async_step_findmy_add()
+            if user_input.get("action") == "remove":
+                return await self.async_step_findmy_remove()
+            return await self.async_step_init()
+
+        if accessories:
+            table = "\n\n|Accessory|Model|Key index|Status|\n|---|---|---:|---|\n"
+            for acc in accessories.values():
+                metadevice = coordinator.devices.get(acc.address)
+                if metadevice is not None and metadevice.metadevice_sources:
+                    status = f"Seen as {metadevice.metadevice_sources[0].upper()}"
+                elif acc.alignment_index:
+                    status = "Aligned, not currently visible"
+                else:
+                    status = "Never seen - searching"
+                table += f"| {acc.friendly_name}| {acc.model or '-'}| {acc.alignment_index}| {status}|\n"
+        else:
+            table = "\n\nNo FindMy accessories configured yet.\n"
+
+        menu_options = {"add": "Add an accessory"}
+        if accessories:
+            menu_options["remove"] = "Remove an accessory"
+        menu_options["back"] = "Back"
+
+        return self.async_show_form(
+            step_id="findmy",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("action", default="add"): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[SelectOptionDict(value=k, label=v) for k, v in menu_options.items()],
+                            mode=SelectSelectorMode.LIST,
+                        )
+                    )
+                }
+            ),
+            description_placeholders={"accessories": table},
+            errors=self._errors,
+        )
+
+    async def async_step_findmy_add(self, user_input=None):
+        """Add a FindMy accessory by pasting its exported key JSON."""
+        self._errors = {}
+
+        if user_input is not None:
+            coordinator = self.config_entry.runtime_data.coordinator
+            try:
+                accessory = FindMyAccessoryKeys.from_json(user_input["accessory_json"])
+            except FindMyKeyError as err:
+                self._errors["base"] = "findmy_invalid"
+                return self.async_show_form(
+                    step_id="findmy_add",
+                    data_schema=self._findmy_add_schema(user_input),
+                    errors=self._errors,
+                    description_placeholders={"error_detail": str(err)},
+                )
+
+            name = (user_input.get("name") or "").strip()
+            if name:
+                accessory.name = name
+
+            coordinator.findmy_manager.add_accessory(accessory)
+            # Persist immediately - the user should not lose this if HA restarts
+            # before the next update cycle.
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={**self.config_entry.data, CONFDATA_FINDMY: coordinator.findmy_manager.dump()},
+            )
+            return await self.async_step_findmy()
+
+        return self.async_show_form(
+            step_id="findmy_add",
+            data_schema=self._findmy_add_schema(),
+            errors=self._errors,
+            description_placeholders={"error_detail": ""},
+        )
+
+    @staticmethod
+    def _findmy_add_schema(user_input=None):
+        """Schema for the paste-JSON form, preserving input across a failed validation."""
+        user_input = user_input or {}
+        return vol.Schema(
+            {
+                vol.Required("accessory_json", default=user_input.get("accessory_json", "")): TextSelector(
+                    TextSelectorConfig(multiline=True)
+                ),
+                vol.Optional("name", default=user_input.get("name", "")): str,
+            }
+        )
+
+    async def async_step_findmy_remove(self, user_input=None):
+        """Remove a configured FindMy accessory."""
+        coordinator = self.config_entry.runtime_data.coordinator
+        accessories = coordinator.findmy_manager.accessories
+
+        if user_input is not None:
+            for address in user_input.get("remove", []):
+                coordinator.findmy_manager.remove_accessory(address)
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={**self.config_entry.data, CONFDATA_FINDMY: coordinator.findmy_manager.dump()},
+            )
+            return await self.async_step_findmy()
+
+        return self.async_show_form(
+            step_id="findmy_remove",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional("remove", default=[]): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SelectOptionDict(value=acc.address, label=acc.friendly_name)
+                                for acc in accessories.values()
+                            ],
+                            multiple=True,
+                        )
+                    )
+                }
+            ),
+        )
 
     async def _update_options(self):
         """Update config entry options."""

@@ -186,6 +186,12 @@ HIST_KEEP_COUNT = 10  # How many old timestamps, rssi, etc to keep for each devi
 CONFDATA_SCANNERS = "scanners"
 DOCS[CONFDATA_SCANNERS] = "Persisted set of known scanners (proxies)"
 
+CONFDATA_FINDMY = "findmy_accessories"
+DOCS[CONFDATA_FINDMY] = (
+    "FindMy accessory key material and alignment state. Contains pairing secrets -"
+    " see the FindMy section of the docs before sharing diagnostics or backups."
+)
+
 # Configuration and options
 
 CONF_DEVICES = "configured_devices"

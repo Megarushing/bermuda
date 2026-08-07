@@ -30,7 +30,7 @@ from __future__ import annotations
 import binascii
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from cryptography.hazmat.primitives import hashes
@@ -109,7 +109,7 @@ class FindMyAccessoryKeys:
     could plausibly be advertising right now.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         master_key: bytes,
@@ -170,7 +170,7 @@ class FindMyAccessoryKeys:
         The key rolls at most once per interval, so this is an upper bound - the
         accessory may have rolled more slowly, or not at all if powered off.
         """
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         if now <= self.alignment_date:
             return self.alignment_index
         return self.alignment_index + int((now - self.alignment_date) // FINDMY_KEY_INTERVAL)
@@ -366,7 +366,7 @@ def _parse_dt(value: str) -> datetime:
 def _ensure_aware(value: datetime) -> datetime:
     """Treat naive timestamps as UTC - FindMy exports are UTC."""
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+        return value.replace(tzinfo=UTC)
     return value
 
 
@@ -437,7 +437,7 @@ class BermudaFindMyManager:
         """Whether the lookup table has aged out of its interval."""
         if self._dirty or self._table.built_at is None:
             return True
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         return now - self._table.built_at >= FINDMY_KEY_INTERVAL
 
     def build_table(self, now: datetime | None = None) -> dict[str, FindMyMacMatch]:
@@ -447,7 +447,7 @@ class BermudaFindMyManager:
         This is the expensive call - one elliptic curve operation per candidate
         index - so it belongs in an executor, and is only run once per key interval.
         """
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         macs: dict[str, FindMyMacMatch] = {}
         for accessory in self._accessories.values():
             macs.update(accessory.macs_for_window(now))
@@ -472,14 +472,14 @@ class BermudaFindMyManager:
             # Secondary indices are on a different scale; only primary tells us
             # where we are in the schedule.
             return False
-        changed = accessory.update_alignment(seen_at or datetime.now(timezone.utc), match.index)
+        changed = accessory.update_alignment(seen_at or datetime.now(UTC), match.index)
         if changed:
             self._dirty = True
         return changed
 
     def async_diagnostics_no_redactions(self) -> dict[str, Any]:
         """Diagnostic info. Secrets are deliberately excluded, not merely redacted."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return {
             "accessories": {
                 acc.address: {

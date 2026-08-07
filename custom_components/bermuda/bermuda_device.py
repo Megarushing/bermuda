@@ -34,6 +34,7 @@ from .bermuda_advert import BermudaAdvert
 from .const import (
     _LOGGER,
     _LOGGER_SPAM_LESS,
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_IBEACON,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
     BDADDR_TYPE_NOT_MAC48,
@@ -48,6 +49,7 @@ from .const import (
     DOMAIN,
     ICON_DEFAULT_AREA,
     ICON_DEFAULT_FLOOR,
+    METADEVICE_FINDMY_DEVICE,
     METADEVICE_IBEACON_DEVICE,
     METADEVICE_PRIVATE_BLE_DEVICE,
     METADEVICE_TYPE_IBEACON_SOURCE,
@@ -175,7 +177,12 @@ class BermudaDevice(dict):
             if self.address.count(":") != 5:
                 # Doesn't look like an actual MAC address - should be some sort of metadevice.
 
-                if re.match("^[A-Fa-f0-9]{32}_[A-Fa-f0-9]*_[A-Fa-f0-9]*$", self.address):
+                if self.address.startswith("findmy_"):
+                    # A FindMy accessory metadevice. Its sources are the rotating MACs
+                    # derived from the accessory's key schedule - see bermuda_findmy.py.
+                    self.address_type = ADDR_TYPE_FINDMY
+                    self.metadevice_type.add(METADEVICE_FINDMY_DEVICE)
+                elif re.match("^[A-Fa-f0-9]{32}_[A-Fa-f0-9]*_[A-Fa-f0-9]*$", self.address):
                     # It's an iBeacon uuid_major_minor
                     self.address_type = ADDR_TYPE_IBEACON
                     self.metadevice_type.add(METADEVICE_IBEACON_DEVICE)
