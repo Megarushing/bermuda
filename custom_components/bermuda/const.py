@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from enum import Enum
 from typing import Final
 
@@ -79,9 +80,19 @@ METADEVICE_TYPE_IBEACON_SOURCE: Final = "beacon source"  # The source-device sen
 METADEVICE_IBEACON_DEVICE: Final = "beacon device"  # The meta-device created to track the beacon
 METADEVICE_TYPE_PRIVATE_BLE_SOURCE: Final = "private_ble_src"  # current (random) MAC of a private ble device
 METADEVICE_PRIVATE_BLE_DEVICE: Final = "private_ble_device"  # meta-device create to track private ble device
+METADEVICE_TYPE_FINDMY_SOURCE: Final = "findmy_src"  # current (rotating) MAC of a FindMy accessory
+METADEVICE_FINDMY_DEVICE: Final = "findmy_device"  # meta-device created to track a FindMy accessory
 
-METADEVICE_SOURCETYPES: Final = {METADEVICE_TYPE_IBEACON_SOURCE, METADEVICE_TYPE_PRIVATE_BLE_SOURCE}
-METADEVICE_DEVICETYPES: Final = {METADEVICE_IBEACON_DEVICE, METADEVICE_PRIVATE_BLE_DEVICE}
+METADEVICE_SOURCETYPES: Final = {
+    METADEVICE_TYPE_IBEACON_SOURCE,
+    METADEVICE_TYPE_PRIVATE_BLE_SOURCE,
+    METADEVICE_TYPE_FINDMY_SOURCE,
+}
+METADEVICE_DEVICETYPES: Final = {
+    METADEVICE_IBEACON_DEVICE,
+    METADEVICE_PRIVATE_BLE_DEVICE,
+    METADEVICE_FINDMY_DEVICE,
+}
 
 # Bluetooth Device Address Type - classify MAC addresses
 BDADDR_TYPE_UNKNOWN: Final = "bd_addr_type_unknown"  # uninitialised
@@ -93,6 +104,7 @@ BDADDR_TYPE_NOT_MAC48: Final = "bd_addr_not_mac48"
 # Non-bluetooth address types - for our metadevice entries
 ADDR_TYPE_IBEACON: Final = "addr_type_ibeacon"
 ADDR_TYPE_PRIVATE_BLE_DEVICE: Final = "addr_type_private_ble_device"
+ADDR_TYPE_FINDMY: Final = "addr_type_findmy"
 
 
 class IrkTypes(Enum):
@@ -140,6 +152,27 @@ PRUNE_TIME_UNKNOWN_IRK = 240  # Resolvable Private addresses change often, prune
 PRUNE_TIME_KNOWN_IRK: Final[int] = 16 * 60  # spec "recommends" 15 min max address age. Round up to 16 :-)
 
 PRUNE_TIME_REDACTIONS: Final[int] = 10 * 60  # when to discard redaction data
+
+# FindMy accessories (AirTags and licensed third-party tags).
+#
+# The advertised key - and therefore the MAC address derived from it - rolls on a
+# fixed 15 minute schedule seeded at pairing. We can't test an address for
+# membership like an IRK, so we generate the addresses the accessory *could* be
+# using and match by lookup.
+FINDMY_KEY_INTERVAL: Final = timedelta(minutes=15)
+# The secondary key chain advances once per this many primary steps (ie, daily).
+FINDMY_SECONDARY_INTERVAL: Final[int] = 96
+# Generate a few indices beyond "now" to tolerate clock skew and early rollover.
+FINDMY_LOOKAHEAD_INDICES: Final[int] = 2
+# An accessory we've never confirmed a sighting for has an unbounded search window
+# (it may have been paired years ago). Cap it - a tag that is present and
+# advertising sits near the top of the range, and one sighting collapses the
+# window via alignment. 2880 indices is 30 days.
+FINDMY_MAX_UNALIGNED_INDICES: Final[int] = 2880
+# The SK chain is sequential and can be 180k+ steps long for a long-paired
+# accessory. Keep a checkpoint every N steps so we can rewind without rewalking
+# from the start, without storing the whole chain.
+FINDMY_SK_CHECKPOINT_INTERVAL: Final[int] = 1024
 
 SAVEOUT_COOLDOWN = 10  # seconds to delay before re-trying config entry save.
 
