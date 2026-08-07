@@ -173,6 +173,14 @@ FINDMY_MAX_UNALIGNED_INDICES: Final[int] = 2880
 # accessory. Keep a checkpoint every N steps so we can rewind without rewalking
 # from the start, without storing the whole chain.
 FINDMY_SK_CHECKPOINT_INTERVAL: Final[int] = 1024
+# Alignment is runtime state, not configuration. It lives in its own Store rather
+# than the config entry, because updating the config entry fires the update
+# listener and reloads the whole integration - which would happen on every
+# sighting, tearing down the very metadevices we just built.
+FINDMY_STORAGE_KEY: Final = f"{DOMAIN}.findmy_alignment"
+FINDMY_STORAGE_VERSION: Final[int] = 1
+# Debounce for alignment writes.
+FINDMY_STORAGE_SAVE_DELAY: Final[int] = 60
 
 SAVEOUT_COOLDOWN = 10  # seconds to delay before re-trying config entry save.
 

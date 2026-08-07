@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import aiofiles
 import voluptuous as vol
@@ -49,7 +49,9 @@ from homeassistant.helpers.device_registry import (
     EventDeviceRegistryUpdatedData,
 )
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 from homeassistant.util.dt import get_age, now
 
 from .bermuda_device import BermudaDevice
@@ -81,6 +83,9 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     DOMAIN_PRIVATE_BLE_DEVICE,
+    FINDMY_STORAGE_KEY,
+    FINDMY_STORAGE_SAVE_DELAY,
+    FINDMY_STORAGE_VERSION,
     METADEVICE_IBEACON_DEVICE,
     METADEVICE_TYPE_FINDMY_SOURCE,
     METADEVICE_TYPE_IBEACON_SOURCE,
@@ -197,6 +202,13 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # Guards against launching overlapping table rebuilds in the executor.
         self._findmy_rebuild_running: bool = False
         self._findmy_alignment_dirty: bool = False
+        # Alignment lives in its own Store. Writing it to the config entry would
+        # trip the update listener and reload the integration on every sighting.
+        self._findmy_store: Store[dict[str, Any]] = Store(hass, FINDMY_STORAGE_VERSION, FINDMY_STORAGE_KEY)
+        if self.findmy_manager.accessories:
+            entry.async_create_background_task(
+                hass, self.async_load_findmy_alignment(), "Load FindMy alignment", eager_start=True
+            )
 
         self.ar = ar.async_get(self.hass)
         self.er = er.async_get(self.hass)
@@ -724,8 +736,10 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         # called by _run in events.py, so pretty sure we are "in the event loop".
                         async_dispatcher_send(self.hass, SIGNAL_DEVICE_NEW, address)
 
-            # Persist any FindMy alignment we learned this cycle.
-            self.async_save_findmy_alignment()
+            # Persist any FindMy alignment we learned this cycle (debounced).
+            if self._findmy_alignment_dirty:
+                self._findmy_alignment_dirty = False
+                self.async_save_findmy_alignment()
 
             # Device Pruning (only runs periodically)
             self.prune_devices()
@@ -1119,20 +1133,49 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
         self.config_entry.async_create_background_task(self.hass, _rebuild(), "Bermuda FindMy table rebuild")
 
+    async def async_load_findmy_alignment(self) -> None:
+        """
+        Restore saved alignment for our accessories.
+
+        Alignment is what keeps the key search window small, so losing it means
+        paying the expensive cold table build again on the next start.
+        """
+        stored = await self._findmy_store.async_load()
+        if not stored:
+            return
+        restored = 0
+        for address, state in stored.items():
+            accessory = self.findmy_manager.accessories.get(address)
+            if accessory is None:
+                continue
+            try:
+                seen_at = dt_util.parse_datetime(state["alignment_date"])
+            except (KeyError, TypeError):
+                continue
+            if seen_at is not None and accessory.update_alignment(seen_at, state.get("alignment_index", 0)):
+                restored += 1
+        _LOGGER.debug("Restored FindMy alignment for %d accessories", restored)
+
+    def _findmy_alignment_data(self) -> dict[str, Any]:
+        """Build the alignment payload for the Store (no key material)."""
+        return {
+            acc.address: {
+                "alignment_index": acc.alignment_index,
+                "alignment_date": acc.alignment_date.isoformat(),
+            }
+            for acc in self.findmy_manager.accessories.values()
+        }
+
     def async_save_findmy_alignment(self) -> None:
         """
-        Persist updated accessory alignment into the config entry.
+        Queue a debounced save of accessory alignment.
 
-        Alignment is what keeps the search window small, so losing it on restart
-        means paying the expensive cold build again.
+        Deliberately NOT written to the config entry: async_update_entry fires the
+        update listener, which reloads the integration. Doing that on every
+        sighting tears down the metadevices we just created and leaves their
+        entities unavailable.
         """
-        if not self._findmy_alignment_dirty:
-            return
-        self._findmy_alignment_dirty = False
-        self.hass.config_entries.async_update_entry(
-            self.config_entry,
-            data={**self.config_entry.data, CONFDATA_FINDMY: self.findmy_manager.dump()},
-        )
+        self._findmy_store.async_delay_save(self._findmy_alignment_data, FINDMY_STORAGE_SAVE_DELAY)
 
     def register_ibeacon_source(self, source_device: BermudaDevice):
         """
