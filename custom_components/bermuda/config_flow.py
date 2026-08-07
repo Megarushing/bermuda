@@ -134,6 +134,8 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         super().__init__(config_entry)
         self.coordinator: BermudaDataUpdateCoordinator
         self.devices: dict[str, BermudaDevice]
+        # Form validation errors, keyed as HA expects (usually "base").
+        self._errors: dict[str, str] = {}
         self._last_ref_power = None
         self._last_device = None
         self._last_scanner = None

@@ -246,3 +246,22 @@ def test_remove_accessory():
     assert manager.remove_accessory(acc.address) is False
     manager.build_table(now)
     assert manager.check_mac(mac) is None
+
+
+def test_options_flow_handler_initialises_errors():
+    """
+    The options flow must define _errors before any step renders a form.
+
+    Regression test: async_step_findmy passed errors=self._errors, but _errors
+    was only initialised on the config flow handler, not the options flow one,
+    so opening the FindMy menu raised AttributeError.
+    """
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from custom_components.bermuda.config_flow import BermudaOptionsFlowHandler
+    from custom_components.bermuda.const import DOMAIN
+
+    entry = MockConfigEntry(domain=DOMAIN, data={}, options={})
+    handler = BermudaOptionsFlowHandler(entry)
+
+    assert handler._errors == {}  # noqa: SLF001
