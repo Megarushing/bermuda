@@ -85,14 +85,14 @@
       },
       "findmy": {
         "title": "FindMy Accessories",
-        "description": "AirTags and licensed Find My tags change their bluetooth address every 15 minutes, so they can't be picked from the device list. Paste their keys instead and Bermuda derives the addresses.\n\nKeys come from [FindMy.py](https://docs.mikealmel.ooo/FindMy.py/getstarted/02-fetching.html).\n{accessories}",
+        "description": "Find My tags rotate their bluetooth address every 15 minutes, so they cannot be picked from the device list. Bermuda derives the addresses from each accessory's keys instead.\n{accessories}",
         "data": {
-          "action": "What would you like to do?"
+          "action": "Action"
         }
       },
       "findmy_add": {
         "title": "Add FindMy Accessory",
-        "description": "Paste the accessory JSON from FindMy.py. It must contain `master_key`, `skn`, `sks` and `paired_at`.\n\n**Getting the keys** — see *Step 1* of the [FindMy.py guide](https://docs.mikealmel.ooo/FindMy.py/getstarted/02-fetching.html):\n- macOS 14 and earlier: `python3 -m findmy decrypt --out-dir devices/`\n- macOS 15: the BeaconStoreKey extractor, then `plist_to_json.py`\n\n**Tip:** include the alignment plist when converting. Without it Bermuda searches a 30 day window before it locks on.\n\n⚠️ **These are pairing secrets.** They let anyone locate this accessory through Apple's Find My network using any Apple ID, and they are included in Home Assistant backups.\n\n{error_detail}",
+        "description": "Paste one accessory's JSON export below. It must contain `master_key`, `skn`, `sks` and `paired_at`. Include the alignment plist when converting, or Bermuda has to search a 30 day window before it locks on.\n\n**Extracting keys** — [FindMy.py, Step 1](https://docs.mikealmel.ooo/FindMy.py/getstarted/02-fetching.html):\n\n| macOS | Method |\n|---|---|\n| 14 and earlier | `python3 -m findmy decrypt --out-dir devices/` |\n| 15 | BeaconStoreKey extractor, then `plist_to_json.py` |\n| 26 | No known method |\n\n⚠️ **This JSON is the accessory's location secret.** Anyone who copies it can track this tag indefinitely, and it is stored unencrypted in Home Assistant backups.\n\n{error_detail}",
         "data": {
           "accessory_json": "Accessory JSON",
           "name": "Name (optional, overrides the name in the JSON)"

@@ -610,7 +610,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             return await self.async_step_init()
 
         if accessories:
-            table = "\n\n|Accessory|Model|Key index|Status|\n|---|---|---:|---|\n"
+            table = "\n\n| Accessory | Model | Key index | Status |\n|---|---|---:|---|\n"
             for acc in accessories.values():
                 metadevice = coordinator.devices.get(acc.address)
                 if metadevice is not None and metadevice.metadevice_sources:
@@ -619,9 +619,9 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                     status = "Aligned, not currently visible"
                 else:
                     status = "Never seen - searching"
-                table += f"| {acc.friendly_name}| {acc.model or '-'}| {acc.alignment_index}| {status}|\n"
+                table += f"| {acc.friendly_name} | {acc.model or '-'} | {acc.alignment_index} | {status} |\n"
         else:
-            table = "\n\nNo FindMy accessories configured yet.\n"
+            table = "\n\nNo accessories configured yet."
 
         menu_options = {"add": "Add an accessory"}
         if accessories:
