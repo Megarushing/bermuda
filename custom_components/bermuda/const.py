@@ -173,6 +173,16 @@ FINDMY_LOOKAHEAD_INDICES: Final[int] = 2
 # Widening only applies to accessories we cannot currently see, which is exactly
 # when a wider net is worth paying for.
 FINDMY_ALIGNMENT_TRUST_INDICES: Final[int] = 4
+# How far below the last confirmed index to keep searching.
+#
+# The floor was pinned at exactly the aligned index, which assumes an accessory
+# never appears below where we last saw it. Observed otherwise on real hardware:
+# a tag aligned at 315 was found advertising 314, one index under the floor, and
+# was therefore invisible - the same lockout as a too-low ceiling, from the other
+# end. Key indices are monotonic in theory, but our record of them comes from
+# estimates and storage that can be wrong, so the floor needs slack. A few
+# indices cost a handful of curve operations.
+FINDMY_LOOKBEHIND_INDICES: Final[int] = 8
 # An accessory we've never confirmed a sighting for has an unbounded search window
 # (it may have been paired years ago). Cap it - a tag that is present and
 # advertising sits near the top of the range, and one sighting collapses the

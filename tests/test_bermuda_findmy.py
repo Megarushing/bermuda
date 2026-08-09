@@ -7,6 +7,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from custom_components.bermuda.const import (
+    FINDMY_LOOKAHEAD_INDICES,
+    FINDMY_LOOKBEHIND_INDICES,
+)
 from custom_components.bermuda.bermuda_findmy import (
     KEY_TYPE_PRIMARY,
     BermudaFindMyManager,
@@ -121,7 +125,8 @@ def test_alignment_collapses_window_and_ignores_regressions():
     assert acc.index_window(now)[0] == 0
 
     assert acc.update_alignment(now, 960) is True
-    assert acc.index_window(now)[0] == 960
+    # The floor tracks the alignment, less the deliberate lookbehind slack.
+    assert acc.index_window(now)[0] == 960 - FINDMY_LOOKBEHIND_INDICES
 
     # Older observation, and a backwards index, are both ignored.
     assert acc.update_alignment(now - timedelta(days=1), 10) is False
@@ -598,7 +603,12 @@ def test_fresh_sighting_collapses_the_window_even_when_pairing_runs_ahead():
     # Seen right now, but well behind where continuous running would put it.
     acc.update_alignment(now, pairing_index - 2000)
     bottom, top = acc.index_window(now)
-    assert top - bottom <= 8, f"a fresh sighting must collapse the window, got {top - bottom + 1} indices"
+    width = top - bottom + 1
+    # A handful of indices: the lookahead, the lookbehind slack and little else -
+    # emphatically not the ~2000 that taking the pairing bound unconditionally gave.
+    assert width <= FINDMY_LOOKBEHIND_INDICES + FINDMY_LOOKAHEAD_INDICES + 4, (
+        f"a fresh sighting must collapse the window, got {width} indices"
+    )
 
     # Stale alignment still widens, so a bad anchor cannot lock the accessory out.
     acc._alignment = (now - timedelta(days=1), pairing_index - 2000)  # noqa: SLF001
@@ -639,3 +649,30 @@ def test_changes_during_a_rebuild_are_not_lost():
         FindMyAccessoryKeys.macs_for_window = original
 
     assert manager.needs_refresh(now) is True, "a mid-build change must leave the table marked dirty"
+
+
+def test_accessory_found_just_below_its_aligned_index():
+    """
+    The window floor must have slack below the last confirmed index.
+
+    Regression test, from live hardware: an accessory whose stored alignment was
+    index 315 was observed advertising index 314. The floor was pinned at exactly
+    the aligned index, so the advert fell one index underneath it and could never
+    match - the same permanent lockout as a too-low ceiling, arriving from the
+    other end. Key indices are monotonic in principle, but our record of them is
+    an estimate that survives restarts, so the floor cannot be treated as exact.
+    """
+    acc = _accessory()
+    now = datetime.fromisoformat(PAIRED_AT) + timedelta(days=3)
+    acc.update_alignment(now, 315)
+
+    bottom, top = acc.index_window(now)
+    assert bottom <= 314, f"floor {bottom} must leave room below the aligned index"
+    assert bottom <= 315 <= top
+
+    manager = BermudaFindMyManager()
+    manager.add_accessory(acc)
+    manager.build_table(now)
+    assert manager.check_mac(acc._mac_at(314, KEY_TYPE_PRIMARY)) is not None  # noqa: SLF001
+    # Still bounded - slack, not a free-for-all.
+    assert bottom >= 315 - 32

@@ -42,6 +42,7 @@ from .const import (
     FINDMY_ALIGNMENT_TRUST_INDICES,
     FINDMY_KEY_INTERVAL,
     FINDMY_LOOKAHEAD_INDICES,
+    FINDMY_LOOKBEHIND_INDICES,
     FINDMY_MAX_UNALIGNED_INDICES,
     FINDMY_SECONDARY_INTERVAL,
     FINDMY_SK_CHECKPOINT_INTERVAL,
@@ -231,7 +232,8 @@ class FindMyAccessoryKeys:
         window via update_alignment().
         """
         top = self.max_index(now) + FINDMY_LOOKAHEAD_INDICES
-        bottom = max(self._alignment[1], top - FINDMY_MAX_UNALIGNED_INDICES)
+        floor = max(0, self._alignment[1] - FINDMY_LOOKBEHIND_INDICES)
+        bottom = max(floor, top - FINDMY_MAX_UNALIGNED_INDICES)
         return bottom, top
 
     def _sk_at(self, ind: int, *, secondary: bool) -> bytes:
