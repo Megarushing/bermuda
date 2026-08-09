@@ -1220,6 +1220,20 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             for acc in self.findmy_manager.accessories.values()
         }
 
+    async def async_flush_findmy_alignment(self) -> None:
+        """
+        Write alignment immediately, for unload and reload.
+
+        The delayed save is only flushed by Home Assistant's final-write on a full
+        stop. On an entry unload or reload there may be nothing queued at all -
+        the throttle means a dirty alignment can be waiting without a pending
+        write - so anything learned since the last queued save would be lost.
+        """
+        if not self.findmy_manager.accessories:
+            return
+        await self._findmy_store.async_save(self._findmy_alignment_data())
+        self._findmy_alignment_dirty = False
+
     def async_save_findmy_alignment(self) -> None:
         """
         Queue a debounced save of accessory alignment.

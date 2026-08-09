@@ -14,8 +14,16 @@ from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_registry import async_migrate_entries
+from homeassistant.helpers.storage import Store
 
-from .const import _LOGGER, DOMAIN, PLATFORMS, STARTUP_MESSAGE
+from .const import (
+    _LOGGER,
+    DOMAIN,
+    FINDMY_STORAGE_KEY,
+    FINDMY_STORAGE_VERSION,
+    PLATFORMS,
+    STARTUP_MESSAGE,
+)
 from .coordinator import BermudaDataUpdateCoordinator
 from .util import mac_math_offset, mac_norm
 
@@ -130,9 +138,20 @@ async def async_remove_config_entry_device(
 
 async def async_unload_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> bool:
     """Handle removal of an entry."""
+    # Alignment is throttled, so a dirty value may have no pending write behind
+    # it. Flush before tearing down or a reload silently loses it.
+    coordinator = getattr(entry, "runtime_data", None)
+    if coordinator is not None:
+        await coordinator.coordinator.async_flush_findmy_alignment()
     if unload_result := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         _LOGGER.debug("Unloaded platforms.")
     return unload_result
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> None:
+    """Delete the FindMy alignment store when the integration is removed."""
+    await Store(hass, FINDMY_STORAGE_VERSION, FINDMY_STORAGE_KEY).async_remove()
+    _LOGGER.debug("Removed FindMy alignment store.")
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> None:

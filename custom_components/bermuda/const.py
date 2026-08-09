@@ -164,6 +164,15 @@ FINDMY_KEY_INTERVAL: Final = timedelta(minutes=15)
 FINDMY_SECONDARY_INTERVAL: Final[int] = 96
 # Generate a few indices beyond "now" to tolerate clock skew and early rollover.
 FINDMY_LOOKAHEAD_INDICES: Final[int] = 2
+# How long a confirmed sighting is trusted on its own, in key intervals.
+#
+# While the alignment is this fresh we believe it outright, which keeps the
+# window down to a handful of indices. Once it is older we can no longer be sure
+# it is right - it may be a stale value reloaded from storage - so the ceiling
+# also takes the pairing-derived bound, which is independent of runtime state.
+# Widening only applies to accessories we cannot currently see, which is exactly
+# when a wider net is worth paying for.
+FINDMY_ALIGNMENT_TRUST_INDICES: Final[int] = 4
 # An accessory we've never confirmed a sighting for has an unbounded search window
 # (it may have been paired years ago). Cap it - a tag that is present and
 # advertising sits near the top of the range, and one sighting collapses the

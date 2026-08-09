@@ -39,6 +39,7 @@ from cryptography.hazmat.primitives.kdf.x963kdf import X963KDF
 
 from .const import (
     _LOGGER,
+    FINDMY_ALIGNMENT_TRUST_INDICES,
     FINDMY_KEY_INTERVAL,
     FINDMY_LOOKAHEAD_INDICES,
     FINDMY_MAX_UNALIGNED_INDICES,
@@ -192,19 +193,28 @@ class FindMyAccessoryKeys:
         The key rolls at most once per interval, so this is an upper bound - the
         accessory may have rolled more slowly, or not at all if powered off.
 
-        Derived from the pairing time as well as from the last confirmed sighting,
-        taking whichever is higher. Anchoring solely on the alignment is a trap: if
-        the stored alignment is ever too low - a stale value reloaded from the Store,
-        say - the ceiling is too low with it, the accessory's real index climbs past
-        it, and because update_alignment() never moves backwards nothing can raise
-        the ceiling again. That locks the accessory out permanently. The pairing
-        time is fixed and independent, so it always offers a valid upper bound.
+        A recent sighting is trusted on its own, which keeps the window to a
+        handful of indices. Once the alignment goes stale we can no longer be sure
+        it is right - it may be a stale value reloaded from the Store - so the
+        pairing-derived bound is taken as well, whichever is higher.
+
+        Both halves matter. Anchoring solely on the alignment is a trap: a too-low
+        alignment gives a too-low ceiling, the accessory's real index climbs past
+        it, and since update_alignment() never moves backwards nothing can raise
+        the ceiling again - a permanent lockout. But always taking the pairing
+        bound is the opposite trap: an accessory that was powered off has a real
+        index behind wall-clock, so the pairing bound stays permanently above it
+        and the window never collapses after a sighting. Trusting a fresh
+        alignment and widening only a stale one avoids both.
         """
         now = now or datetime.now(UTC)
         align_date, align_index = self._alignment
-        from_alignment = align_index
+        elapsed = 0
         if now > align_date:
-            from_alignment = align_index + int((now - align_date) // FINDMY_KEY_INTERVAL)
+            elapsed = int((now - align_date) // FINDMY_KEY_INTERVAL)
+        from_alignment = align_index + elapsed
+        if elapsed <= FINDMY_ALIGNMENT_TRUST_INDICES:
+            return from_alignment
         from_pairing = 0
         if now > self.paired_at:
             from_pairing = int((now - self.paired_at) // FINDMY_KEY_INTERVAL)
@@ -290,7 +300,14 @@ class FindMyAccessoryKeys:
 
     def _prune_caches(self, bottom: int) -> None:
         """Drop cached MACs below the current window so we don't grow forever."""
-        stale = [key for key in self._mac_cache if key[0] < bottom - FINDMY_MAX_UNALIGNED_INDICES]
+        # Only primary indices track the window. Secondary ones are small and
+        # bounded, so this test would evict all of them on every rebuild once the
+        # window moves past the cap, and they would be re-derived each time.
+        stale = [
+            key
+            for key in self._mac_cache
+            if key[1] == KEY_TYPE_PRIMARY and key[0] < bottom - FINDMY_MAX_UNALIGNED_INDICES
+        ]
         for key in stale:
             del self._mac_cache[key]
 
@@ -486,15 +503,21 @@ class BermudaFindMyManager:
         index - so it belongs in an executor, and is only run once per key interval.
         """
         now = now or datetime.now(UTC)
+        # Clear the flag first, and iterate a snapshot. This runs in an executor
+        # while the event loop may be adding or removing accessories or recording
+        # sightings: iterating the live dict can raise "changed size during
+        # iteration", and clearing the flag afterwards would discard a change that
+        # arrived mid-build, hiding it until the next interval.
+        self._dirty = False
+        accessories = list(self._accessories.values())
         macs: dict[str, FindMyMacMatch] = {}
-        for accessory in self._accessories.values():
+        for accessory in accessories:
             macs.update(accessory.macs_for_window(now))
         self._table = _TableState(macs=macs, built_at=now)
-        self._dirty = False
         _LOGGER.debug(
             "FindMy MAC table rebuilt: %d addresses across %d accessories",
             len(macs),
-            len(self._accessories),
+            len(accessories),
         )
         return macs
 

@@ -569,3 +569,73 @@ def test_purge_removes_only_malformed_bluetooth_connections():
     assert updates["d1"] == {findmy_conn}, "the namespaced findmy connection must survive"
     assert updates["d3"] == set()
     assert "d2" not in updates, "a real MAC must not be touched"
+
+
+def test_fresh_sighting_collapses_the_window_even_when_pairing_runs_ahead():
+    """
+    A confirmed sighting must collapse the window, not just widen the ceiling.
+
+    Regression test: taking the pairing-derived bound unconditionally broke this.
+    An accessory that has been powered off has a real key index behind wall-clock
+    - its schedule only advances while it runs - so the pairing bound sits
+    permanently above it. With the ceiling pinned there and the floor at the
+    (correct) alignment, the window never collapsed after a sighting: measured
+    2003 indices where it should be 3, costing ~0.7s of elliptic curve work every
+    15 minutes, forever.
+
+    A fresh alignment is trusted on its own; only a stale one is widened.
+    """
+    raw = json.loads(ACCESSORY_JSON)
+    paired = datetime(2024, 1, 1, tzinfo=UTC)
+    raw["paired_at"] = paired.isoformat()
+    raw["alignment_date"] = paired.isoformat()
+    raw["alignment_index"] = 0
+    acc = FindMyAccessoryKeys.from_json(json.dumps(raw))
+
+    now = paired + timedelta(days=91)
+    pairing_index = int((now - paired) // timedelta(minutes=15))
+
+    # Seen right now, but well behind where continuous running would put it.
+    acc.update_alignment(now, pairing_index - 2000)
+    bottom, top = acc.index_window(now)
+    assert top - bottom <= 8, f"a fresh sighting must collapse the window, got {top - bottom + 1} indices"
+
+    # Stale alignment still widens, so a bad anchor cannot lock the accessory out.
+    acc._alignment = (now - timedelta(days=1), pairing_index - 2000)  # noqa: SLF001
+    bottom, top = acc.index_window(now)
+    assert top >= pairing_index, "a stale alignment must still reach the pairing-derived bound"
+
+
+def test_changes_during_a_rebuild_are_not_lost():
+    """
+    A change arriving mid-rebuild must still force another rebuild.
+
+    Regression test: build_table() ran the expensive loop and *then* set
+    _dirty = False, so an accessory added - or a sighting recorded - while the
+    executor was working had its flag cleared and stayed invisible until the key
+    interval expired. It also iterated the live dict, which the event loop can
+    mutate underneath it ("dictionary changed size during iteration").
+    """
+    manager = BermudaFindMyManager()
+    manager.add_accessory(_accessory())
+    now = datetime.fromisoformat(PAIRED_AT)
+
+    # Simulate the event loop touching the manager during the build, which is
+    # exactly when macs_for_window() is running in the executor.
+    original = FindMyAccessoryKeys.macs_for_window
+    second = FindMyAccessoryKeys.from_json(
+        json.dumps({**json.loads(ACCESSORY_JSON), "identifier": "FFFFFFFF-1111-2222-3333-444444444444"})
+    )
+
+    def racing(self, when=None):
+        if second.address not in manager.accessories:
+            manager.add_accessory(second)
+        return original(self, when)
+
+    FindMyAccessoryKeys.macs_for_window = racing
+    try:
+        manager.build_table(now)
+    finally:
+        FindMyAccessoryKeys.macs_for_window = original
+
+    assert manager.needs_refresh(now) is True, "a mid-build change must leave the table marked dirty"
