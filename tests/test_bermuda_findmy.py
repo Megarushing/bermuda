@@ -519,3 +519,53 @@ def test_stale_alignment_cannot_lock_an_accessory_out():
     # And a fresh, correct alignment must still win when it is ahead of pairing.
     acc._alignment = (now, real_index + 40)  # noqa: SLF001
     assert acc.max_index(now) == real_index + 40
+
+
+def test_purge_removes_only_malformed_bluetooth_connections():
+    """
+    Malformed CONNECTION_BLUETOOTH tuples must be removed, real ones kept.
+
+    Regression test: metadevices have no bluetooth address, but an earlier
+    version let them fall through to the generic branch, which registered the
+    metadevice id as a bluetooth connection. Device registry connections merge
+    on update, so emitting the correct tuple never displaced the wrong one -
+    it has to be removed explicitly. Connections are how HA matches devices
+    across integrations, so a malformed one is not merely cosmetic.
+    """
+    from types import SimpleNamespace
+
+    from homeassistant.helpers import device_registry as dr
+
+    from custom_components.bermuda.coordinator import BermudaDataUpdateCoordinator
+
+    bogus = (dr.CONNECTION_BLUETOOTH, "FINDMY_DC447A349C7243948C966A381492382D")
+    good = (dr.CONNECTION_BLUETOOTH, "AA:BB:CC:DD:EE:FF")
+    findmy_conn = ("findmy", "findmy_dc447a349c7243948c966a381492382d")
+
+    devices = [
+        SimpleNamespace(id="d1", name="Snowden", connections={bogus, findmy_conn}),
+        SimpleNamespace(id="d2", name="A real scanner", connections={good}),
+        SimpleNamespace(id="d3", name="Morticia", connections={bogus}),
+    ]
+    updates: dict[str, set] = {}
+
+    coordinator = SimpleNamespace(
+        dr=SimpleNamespace(
+            async_update_device=lambda did, new_connections: updates.__setitem__(did, new_connections),
+        ),
+        config_entry=SimpleNamespace(entry_id="e1"),
+    )
+
+    import custom_components.bermuda.coordinator as coord_mod
+
+    original = coord_mod.dr.async_entries_for_config_entry
+    coord_mod.dr.async_entries_for_config_entry = lambda _reg, _eid: devices
+    try:
+        cleaned = BermudaDataUpdateCoordinator.async_purge_invalid_bluetooth_connections(coordinator)
+    finally:
+        coord_mod.dr.async_entries_for_config_entry = original
+
+    assert cleaned == 2
+    assert updates["d1"] == {findmy_conn}, "the namespaced findmy connection must survive"
+    assert updates["d3"] == set()
+    assert "d2" not in updates, "a real MAC must not be touched"

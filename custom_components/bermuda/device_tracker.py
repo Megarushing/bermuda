@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.device_tracker import BaseScannerEntity
+from homeassistant.components.device_tracker import ScannerEntity
 from homeassistant.components.device_tracker.const import SourceType
 from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from homeassistant.core import HomeAssistant, callback
@@ -59,12 +59,17 @@ async def async_setup_entry(
     # await coordinator.async_config_entry_first_refresh()
 
 
-class BermudaDeviceTracker(BermudaEntity, BaseScannerEntity):
+class BermudaDeviceTracker(BermudaEntity, ScannerEntity):
     """A trackable Bermuda Device."""
 
-    # We switched from BaseTrackerEntity to BaseScannerEntity for in_zone changes
+    # We switched from BaseTrackerEntity to a scanner entity for in_zone changes
     # and also because Tracker now seems more reliant on the lat/long
     # being present in order to report state correctly).
+    #
+    # Subclass ScannerEntity, not BaseScannerEntity: HA folded the latter into
+    # the former and removed it, which broke importing this module entirely.
+    # ScannerEntity exists either side of that change (it subclassed
+    # BaseScannerEntity before it), so this works on both.
 
     _attr_should_poll = False
     _attr_has_entity_name = True

@@ -125,6 +125,10 @@ Cancellable = Callable[[], None]
 # ruff: noqa: PLR1730
 
 
+# A MAC-48 in the colon-separated form HA uses for CONNECTION_BLUETOOTH.
+MAC_ADDRESS_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
+
 class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
     """
     Class to manage fetching data from the Bluetooth component.
@@ -213,6 +217,8 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             entry.async_create_background_task(
                 hass, self.async_load_findmy_alignment(), "Load FindMy alignment", eager_start=True
             )
+        # One-off cleanup of malformed connections written by earlier versions.
+        self._purge_connections_pending = True
 
         self.ar = ar.async_get(self.hass)
         self.er = er.async_get(self.hass)
@@ -753,6 +759,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 self._findmy_alignment_last_queued = nowstamp
                 self.async_save_findmy_alignment()
 
+            # Once per start, after metadevices have had a chance to register.
+            if self._purge_connections_pending:
+                self._purge_connections_pending = False
+                self.async_purge_invalid_bluetooth_connections()
+
             # Device Pruning (only runs periodically)
             self.prune_devices()
 
@@ -1144,6 +1155,37 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 self._findmy_rebuild_running = False
 
         self.config_entry.async_create_background_task(self.hass, _rebuild(), "Bermuda FindMy table rebuild")
+
+    @callback
+    def async_purge_invalid_bluetooth_connections(self) -> int:
+        """
+        Drop device-registry connections that claim to be a MAC but are not.
+
+        Metadevices have no bluetooth address, so a version of this integration
+        that let them fall through to the generic CONNECTION_BLUETOOTH branch
+        registered their metadevice id as though it were one. Device registry
+        connections *merge* on update, so simply emitting the right tuple does
+        not displace the wrong one - it has to be removed. Connections are how HA
+        matches devices across integrations, so a malformed one risks colliding
+        with a real device.
+
+        Returns the number of devices cleaned, for logging and tests.
+        """
+        cleaned = 0
+        for device in dr.async_entries_for_config_entry(self.dr, self.config_entry.entry_id):
+            bogus = {
+                conn
+                for conn in device.connections
+                if conn[0] == dr.CONNECTION_BLUETOOTH and not MAC_ADDRESS_RE.match(conn[1])
+            }
+            if not bogus:
+                continue
+            _LOGGER.debug("Removing %d malformed bluetooth connection(s) from %s", len(bogus), device.name)
+            self.dr.async_update_device(device.id, new_connections=device.connections - bogus)
+            cleaned += 1
+        if cleaned:
+            _LOGGER.info("Cleaned malformed bluetooth connections from %d device(s)", cleaned)
+        return cleaned
 
     async def async_load_findmy_alignment(self) -> None:
         """
