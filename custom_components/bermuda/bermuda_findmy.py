@@ -163,8 +163,11 @@ class FindMyAccessoryKeys:
         # sk[n-1] - and an accessory paired years ago can be 180,000+ steps along
         # it. A KDF step is only ~3us, but we must never scan or store the whole
         # chain: we keep a moving head plus sparse checkpoints to rewind to.
-        self._sk_head: dict[bool, tuple[int, bytes]] = {False: (0, skn), True: (0, sks)}
-        self._sk_checkpoints: dict[bool, dict[int, bytes]] = {False: {0: skn}, True: {0: sks}}
+        self._sk_head: dict[str, tuple[int, bytes]] = {KEY_TYPE_PRIMARY: (0, skn), KEY_TYPE_SECONDARY: (0, sks)}
+        self._sk_checkpoints: dict[str, dict[int, bytes]] = {
+            KEY_TYPE_PRIMARY: {0: skn},
+            KEY_TYPE_SECONDARY: {0: sks},
+        }
         self._mac_cache: dict[tuple[int, str], str] = {}
 
     @property
@@ -232,11 +235,11 @@ class FindMyAccessoryKeys:
         window via update_alignment().
         """
         top = self.max_index(now) + FINDMY_LOOKAHEAD_INDICES
-        floor = max(0, self._alignment[1] - FINDMY_LOOKBEHIND_INDICES)
+        floor = max(0, self.alignment_index - FINDMY_LOOKBEHIND_INDICES)
         bottom = max(floor, top - FINDMY_MAX_UNALIGNED_INDICES)
         return bottom, top
 
-    def _sk_at(self, ind: int, *, secondary: bool) -> bytes:
+    def _sk_at(self, ind: int, key_type: str) -> bytes:
         """
         Walk the SK chain to the given index.
 
@@ -244,33 +247,31 @@ class FindMyAccessoryKeys:
         head. Going backwards rewinds to the nearest checkpoint at or below the
         target and walks forward from there.
         """
-        head_ind, head_sk = self._sk_head[secondary]
+        head_ind, head_sk = self._sk_head[key_type]
         if ind == head_ind:
             return head_sk
 
+        checkpoints = self._sk_checkpoints[key_type]
         if ind > head_ind:
             start, sk = head_ind, head_sk
         else:
-            checkpoints = self._sk_checkpoints[secondary]
             start = max((i for i in checkpoints if i <= ind), default=0)
             sk = checkpoints[start]
 
-        checkpoints = self._sk_checkpoints[secondary]
         for cur in range(start + 1, ind + 1):
             sk = _x963_kdf(sk, b"update", 32)
             if cur % FINDMY_SK_CHECKPOINT_INTERVAL == 0:
                 checkpoints[cur] = sk
 
         if ind > head_ind:
-            self._sk_head[secondary] = (ind, sk)
+            self._sk_head[key_type] = (ind, sk)
         return sk
 
     def _mac_at(self, ind: int, key_type: str) -> str:
         """Derive (and cache) the MAC address for one index and key type."""
         if (mac := self._mac_cache.get((ind, key_type))) is not None:
             return mac
-        secondary = key_type == KEY_TYPE_SECONDARY
-        sk = self._sk_at(ind, secondary=secondary)
+        sk = self._sk_at(ind, key_type)
         privkey = _derive_ps_key(self._master_key, sk)
         mac = mac_from_public_key(_public_key_bytes(privkey))
         self._mac_cache[(ind, key_type)] = mac
@@ -301,15 +302,18 @@ class FindMyAccessoryKeys:
         return macs
 
     def _prune_caches(self, bottom: int) -> None:
-        """Drop cached MACs below the current window so we don't grow forever."""
-        # Only primary indices track the window. Secondary ones are small and
-        # bounded, so this test would evict all of them on every rebuild once the
-        # window moves past the cap, and they would be re-derived each time.
-        stale = [
-            key
-            for key in self._mac_cache
-            if key[1] == KEY_TYPE_PRIMARY and key[0] < bottom - FINDMY_MAX_UNALIGNED_INDICES
-        ]
+        """
+        Drop cached MACs well below the current window so we don't grow forever.
+
+        Only worth doing once the cache has actually grown: the scan is O(cache),
+        and running it on every build spent more time looking for stale entries
+        than deriving the addresses. Only primary indices track the window -
+        secondary ones are few and bounded, so they are never evicted.
+        """
+        if len(self._mac_cache) <= FINDMY_MAX_UNALIGNED_INDICES:
+            return
+        cutoff = bottom - FINDMY_LOOKBEHIND_INDICES
+        stale = [key for key in self._mac_cache if key[1] == KEY_TYPE_PRIMARY and key[0] < cutoff]
         for key in stale:
             del self._mac_cache[key]
 
@@ -366,7 +370,7 @@ class FindMyAccessoryKeys:
             master_key = _unhex(data["master_key"], "master_key")
             skn = _unhex(data["skn"], "skn")
             sks = _unhex(data["sks"], "sks")
-            paired_at = _parse_dt(data["paired_at"])
+            paired_at = parse_findmy_datetime(data["paired_at"])
         except KeyError as err:
             msg = f"Missing required field: {err.args[0]}"
             raise FindMyKeyError(msg) from err
@@ -381,7 +385,7 @@ class FindMyAccessoryKeys:
             model=data.get("model"),
             identifier=data.get("identifier"),
             serial_number=data.get("serial_number"),
-            alignment_date=_parse_dt(alignment_date) if alignment_date else None,
+            alignment_date=parse_findmy_datetime(alignment_date) if alignment_date else None,
             alignment_index=data.get("alignment_index") or 0,
         )
 
@@ -411,7 +415,7 @@ def _unhex(value: str, field_name: str) -> bytes:
         raise FindMyKeyError(msg) from err
 
 
-def _parse_dt(value: str) -> datetime:
+def parse_findmy_datetime(value: str) -> datetime:
     """Parse an ISO timestamp, assuming UTC if no timezone is given."""
     try:
         return _ensure_aware(datetime.fromisoformat(value))
@@ -469,6 +473,9 @@ class BermudaFindMyManager:
         """Remove an accessory by metadevice address."""
         if self._accessories.pop(address, None) is None:
             return False
+        # Drop the table too, so its addresses stop matching immediately rather
+        # than until the next rebuild.
+        self._table = _TableState()
         self._dirty = True
         return True
 
@@ -486,8 +493,6 @@ class BermudaFindMyManager:
 
     def check_mac(self, address: str) -> FindMyMacMatch | None:
         """Look up an observed address. Cheap - a dict hit on a precomputed table."""
-        if not self._accessories:
-            return None
         return self._table.macs.get(address)
 
     def needs_refresh(self, now: datetime | None = None) -> bool:
@@ -535,8 +540,13 @@ class BermudaFindMyManager:
             # Secondary indices are on a different scale; only primary tells us
             # where we are in the schedule.
             return False
+        previous_index = accessory.alignment_index
         changed = accessory.update_alignment(seen_at or datetime.now(UTC), match.index)
-        if changed:
+        # Only a *moved index* changes which addresses we should be looking for.
+        # Every advert refreshes the timestamp, so dirtying the table on that would
+        # rebuild it on every cycle instead of once per key interval - the caller
+        # still gets True, because the newer timestamp is worth persisting.
+        if changed and accessory.alignment_index != previous_index:
             self._dirty = True
         return changed
 

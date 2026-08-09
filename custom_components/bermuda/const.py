@@ -198,18 +198,9 @@ FINDMY_SK_CHECKPOINT_INTERVAL: Final[int] = 1024
 # sighting, tearing down the very metadevices we just built.
 FINDMY_STORAGE_KEY: Final = f"{DOMAIN}.findmy_alignment"
 FINDMY_STORAGE_VERSION: Final[int] = 1
-# Debounce for alignment writes.
+# Cooldown for alignment writes, in seconds. Sightings inside the window
+# coalesce into a single write at the end of it.
 FINDMY_STORAGE_SAVE_DELAY: Final[int] = 60
-# Minimum gap between *queueing* alignment writes, in seconds.
-#
-# Store.async_delay_save is a resetting debounce with no max wait: every call
-# pushes its timer forward, and a timer that fires early reschedules itself
-# (homeassistant/helpers/storage.py, _async_schedule_callback_delayed_write).
-# Alignment changes on essentially every sighting, so queueing a save each cycle
-# means a tag that stays in view starves the write indefinitely - the file on
-# disk then goes hours stale and a restart reloads an ancient index. Throttling
-# the queueing well above the debounce guarantees each one actually lands.
-FINDMY_STORAGE_MIN_INTERVAL: Final[int] = 300
 
 SAVEOUT_COOLDOWN = 10  # seconds to delay before re-trying config entry save.
 

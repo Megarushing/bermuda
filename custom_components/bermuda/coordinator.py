@@ -44,6 +44,7 @@ from homeassistant.helpers import (
 from homeassistant.helpers import (
     issue_registry as ir,
 )
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import (
     EVENT_DEVICE_REGISTRY_UPDATED,
     EventDeviceRegistryUpdatedData,
@@ -51,11 +52,10 @@ from homeassistant.helpers.device_registry import (
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.util import dt as dt_util
 from homeassistant.util.dt import get_age, now
 
 from .bermuda_device import BermudaDevice
-from .bermuda_findmy import BermudaFindMyManager, FindMyMacMatch
+from .bermuda_findmy import BermudaFindMyManager, FindMyKeyError, FindMyMacMatch, parse_findmy_datetime
 from .bermuda_irk import BermudaIrkManager
 from .const import (
     _LOGGER,
@@ -85,7 +85,6 @@ from .const import (
     DOMAIN,
     DOMAIN_PRIVATE_BLE_DEVICE,
     FINDMY_STORAGE_KEY,
-    FINDMY_STORAGE_MIN_INTERVAL,
     FINDMY_STORAGE_SAVE_DELAY,
     FINDMY_STORAGE_VERSION,
     METADEVICE_IBEACON_DEVICE,
@@ -207,18 +206,28 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self.findmy_manager.load(entry.data.get(CONFDATA_FINDMY, []))
         # Guards against launching overlapping table rebuilds in the executor.
         self._findmy_rebuild_running: bool = False
-        self._findmy_alignment_dirty: bool = False
-        # Monotonic stamp of the last queued alignment write, for throttling.
-        self._findmy_alignment_last_queued: float = 0.0
+        # Building the table before the stored alignment lands would search the
+        # full unaligned window - seconds of curve operations - and be thrown away
+        # moments later.
+        self._findmy_alignment_loaded: bool = not self.findmy_manager.accessories
         # Alignment lives in its own Store. Writing it to the config entry would
         # trip the update listener and reload the integration on every sighting.
         self._findmy_store: Store[dict[str, Any]] = Store(hass, FINDMY_STORAGE_VERSION, FINDMY_STORAGE_KEY)
+        # Alignment changes on essentially every sighting, so the writes are
+        # coalesced. A Debouncer rather than Store.async_delay_save: the latter
+        # pushes its timer forward on every call, so a tag that stays in view
+        # starves the write indefinitely and the file on disk goes hours stale.
+        self._findmy_alignment_debouncer = Debouncer(
+            hass,
+            _LOGGER,
+            cooldown=FINDMY_STORAGE_SAVE_DELAY,
+            immediate=False,
+            function=self.async_flush_findmy_alignment,
+        )
         if self.findmy_manager.accessories:
             entry.async_create_background_task(
                 hass, self.async_load_findmy_alignment(), "Load FindMy alignment", eager_start=True
             )
-        # One-off cleanup of malformed connections written by earlier versions.
-        self._purge_connections_pending = True
 
         self.ar = ar.async_get(self.hass)
         self.er = er.async_get(self.hass)
@@ -748,22 +757,6 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         # called by _run in events.py, so pretty sure we are "in the event loop".
                         async_dispatcher_send(self.hass, SIGNAL_DEVICE_NEW, address)
 
-            # Persist any FindMy alignment we learned this cycle. Throttled, not
-            # merely debounced - see FINDMY_STORAGE_MIN_INTERVAL for why queueing
-            # a save every cycle means the write never actually happens.
-            if (
-                self._findmy_alignment_dirty
-                and nowstamp - self._findmy_alignment_last_queued >= FINDMY_STORAGE_MIN_INTERVAL
-            ):
-                self._findmy_alignment_dirty = False
-                self._findmy_alignment_last_queued = nowstamp
-                self.async_save_findmy_alignment()
-
-            # Once per start, after metadevices have had a chance to register.
-            if self._purge_connections_pending:
-                self._purge_connections_pending = False
-                self.async_purge_invalid_bluetooth_connections()
-
             # Device Pruning (only runs periodically)
             self.prune_devices()
 
@@ -1128,7 +1121,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # Record the sighting so the accessory's search window collapses to the
         # indices around where it actually is.
         if self.findmy_manager.note_sighting(match):
-            self._findmy_alignment_dirty = True
+            self._findmy_alignment_debouncer.async_schedule_call()
 
     def _async_refresh_findmy_table(self) -> None:
         """
@@ -1139,7 +1132,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         established the window is a handful of indices and it is trivial, but we
         keep it off the loop regardless for predictability.
         """
-        if self._findmy_rebuild_running or not self.findmy_manager.accessories:
+        if self._findmy_rebuild_running or not self._findmy_alignment_loaded:
             return
         if not self.findmy_manager.needs_refresh():
             return
@@ -1194,7 +1187,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         Alignment is what keeps the key search window small, so losing it means
         paying the expensive cold table build again on the next start.
         """
-        stored = await self._findmy_store.async_load()
+        try:
+            stored = await self._findmy_store.async_load()
+        finally:
+            # Even on failure, unblock the rebuild - a wide window beats none.
+            self._findmy_alignment_loaded = True
         if not stored:
             return
         restored = 0
@@ -1203,10 +1200,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             if accessory is None:
                 continue
             try:
-                seen_at = dt_util.parse_datetime(state["alignment_date"])
-            except (KeyError, TypeError):
+                seen_at = parse_findmy_datetime(state["alignment_date"])
+            except (KeyError, FindMyKeyError):
+                _LOGGER.debug("Skipping unreadable stored alignment for %s", address)
                 continue
-            if seen_at is not None and accessory.update_alignment(seen_at, state.get("alignment_index", 0)):
+            if accessory.update_alignment(seen_at, state.get("alignment_index", 0)):
                 restored += 1
         _LOGGER.debug("Restored FindMy alignment for %d accessories", restored)
 
@@ -1232,18 +1230,6 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         if not self.findmy_manager.accessories:
             return
         await self._findmy_store.async_save(self._findmy_alignment_data())
-        self._findmy_alignment_dirty = False
-
-    def async_save_findmy_alignment(self) -> None:
-        """
-        Queue a debounced save of accessory alignment.
-
-        Deliberately NOT written to the config entry: async_update_entry fires the
-        update listener, which reloads the integration. Doing that on every
-        sighting tears down the metadevices we just created and leaves their
-        entities unavailable.
-        """
-        self._findmy_store.async_delay_save(self._findmy_alignment_data, FINDMY_STORAGE_SAVE_DELAY)
 
     def register_ibeacon_source(self, source_device: BermudaDevice):
         """

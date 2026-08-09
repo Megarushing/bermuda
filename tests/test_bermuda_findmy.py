@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -314,9 +315,8 @@ def test_alignment_persists_without_touching_the_config_entry():
 
     saved: dict = {}
 
-    def _delay_save(func, delay):
-        saved["payload"] = func()
-        saved["delay"] = delay
+    async def _save(payload):
+        saved["payload"] = payload
 
     def _explode(*_args, **_kwargs):
         msg = "alignment must not be written to the config entry - it triggers a reload"
@@ -324,12 +324,12 @@ def test_alignment_persists_without_touching_the_config_entry():
 
     coordinator = SimpleNamespace(
         findmy_manager=manager,
-        _findmy_store=SimpleNamespace(async_delay_save=_delay_save),
+        _findmy_store=SimpleNamespace(async_save=_save),
         hass=SimpleNamespace(config_entries=SimpleNamespace(async_update_entry=_explode)),
     )
     coordinator._findmy_alignment_data = lambda: BermudaDataUpdateCoordinator._findmy_alignment_data(coordinator)  # noqa: SLF001
 
-    BermudaDataUpdateCoordinator.async_save_findmy_alignment(coordinator)
+    asyncio.run(BermudaDataUpdateCoordinator.async_flush_findmy_alignment(coordinator))
 
     assert saved["payload"] == {
         acc.address: {
@@ -420,67 +420,52 @@ async def test_removing_an_accessory_triggers_an_alignment_save():
 
 def test_alignment_writes_cannot_be_starved_by_continuous_sightings():
     """
-    Queueing an alignment save must be throttled, not merely debounced.
+    The alignment write must land even while a tag is continuously in view.
 
-    Regression test: Store.async_delay_save is a resetting debounce with no max
-    wait - each call pushes its timer forward, and a timer firing early
-    reschedules itself rather than writing (see
+    Regression test: this used Store.async_delay_save, which is a resetting
+    debounce with no maximum wait - every call pushes its timer forward, and a
+    timer that fires early reschedules itself (see
     homeassistant/helpers/storage.py::_async_schedule_callback_delayed_write).
-    Alignment changes on essentially every sighting, so queueing a save every
-    coordinator cycle meant a tag that stayed in view starved the write for as
-    long as it was visible. Observed live: alignment on disk was 19 hours stale
-    while the tag had been tracking continuously, and a restart then reloaded
-    the ancient index.
+    Alignment changes on essentially every sighting, so a tag that stayed in view
+    starved the write for as long as it was visible: observed 19 hours stale on
+    live hardware, and a restart then reloaded the ancient index.
 
-    This models the real Store timer semantics and asserts a write lands.
+    homeassistant.helpers.debounce.Debouncer has the semantics we actually want -
+    calls inside the cooldown coalesce into one execution at the end of it rather
+    than pushing it back - so this asserts we are using that, and models both
+    behaviours to show why it matters.
     """
-    from types import SimpleNamespace
+    import inspect
 
-    from custom_components.bermuda.const import FINDMY_STORAGE_MIN_INTERVAL, FINDMY_STORAGE_SAVE_DELAY
+    from custom_components.bermuda.coordinator import BermudaDataUpdateCoordinator
 
-    class FakeStore:
-        """Store.async_delay_save's resetting-debounce behaviour."""
+    src = inspect.getsource(BermudaDataUpdateCoordinator)
+    assert "Debouncer(" in src, "alignment writes must use Debouncer, not a resetting delay-save"
+    # The call, not the word - the comments explain why we avoid it.
+    assert "_findmy_store.async_delay_save" not in src, "Store.async_delay_save starves under continuous sightings"
 
-        def __init__(self):
-            self.fire_at: float | None = None
-            self.writes = 0
+    # Model both timers against one hour of continuous, every-cycle sightings.
+    cooldown, cycle, cycles = 60.0, 10.0, 360
 
-        def async_delay_save(self, _func, delay):
-            # Every call pushes the deadline out - this is the trap.
-            self.fire_at = NOW[0] + delay
+    resetting_writes = 0
+    fire_at = None
+    for i in range(1, cycles + 1):
+        now = i * cycle
+        fire_at = now + cooldown  # every call pushes it out - the trap
+        if fire_at is not None and now >= fire_at:
+            resetting_writes += 1
+    assert resetting_writes == 0, "the old mechanism could never write while sightings continued"
 
-        def tick(self):
-            if self.fire_at is not None and NOW[0] >= self.fire_at:
-                self.writes += 1
-                self.fire_at = None
-
-    NOW = [0.0]
-    store = FakeStore()
-
-    # A tag in continuous view: alignment goes dirty on every cycle.
-    last_queued = 0.0
-    cycle = 10.0  # coordinator cycles far more often than the debounce delay
-    for _ in range(360):  # one hour of continuous sightings
-        NOW[0] += cycle
-        dirty = True
-        if dirty and NOW[0] - last_queued >= FINDMY_STORAGE_MIN_INTERVAL:
-            last_queued = NOW[0]
-            store.async_delay_save(lambda: {}, FINDMY_STORAGE_SAVE_DELAY)
-        store.tick()
-
-    assert store.writes > 0, "throttled queueing must let the debounce actually fire"
-    # Sanity: the throttle must be comfortably longer than the debounce, or the
-    # same starvation returns.
-    assert FINDMY_STORAGE_MIN_INTERVAL > FINDMY_STORAGE_SAVE_DELAY
-
-    # And prove the old behaviour (queue every cycle) really did starve.
-    NOW[0] = 0.0
-    naive = FakeStore()
-    for _ in range(360):
-        NOW[0] += cycle
-        naive.async_delay_save(lambda: {}, FINDMY_STORAGE_SAVE_DELAY)
-        naive.tick()
-    assert naive.writes == 0, "the un-throttled version should never have written"
+    coalescing_writes = 0
+    timer_ends = None
+    for i in range(1, cycles + 1):
+        now = i * cycle
+        if timer_ends is None:
+            timer_ends = now + cooldown  # first call starts it; later ones just ride along
+        if now >= timer_ends:
+            coalescing_writes += 1
+            timer_ends = None
+    assert coalescing_writes > 0, "Debouncer semantics must let the write land"
 
 
 def test_stale_alignment_cannot_lock_an_accessory_out():

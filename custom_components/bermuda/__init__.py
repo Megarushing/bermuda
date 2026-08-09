@@ -66,6 +66,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> b
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # One-shot migration: earlier versions let metadevices fall through to the
+    # generic device_info branch, which registered their id as a bluetooth
+    # connection. Runs here rather than in the update loop - it is a migration,
+    # not per-cycle work.
+    coordinator.async_purge_invalid_bluetooth_connections()
+
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
     return True
