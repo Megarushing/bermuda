@@ -85,6 +85,7 @@ from .const import (
     DOMAIN,
     DOMAIN_PRIVATE_BLE_DEVICE,
     FINDMY_STORAGE_KEY,
+    FINDMY_STORAGE_MIN_INTERVAL,
     FINDMY_STORAGE_SAVE_DELAY,
     FINDMY_STORAGE_VERSION,
     METADEVICE_IBEACON_DEVICE,
@@ -203,6 +204,8 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # Guards against launching overlapping table rebuilds in the executor.
         self._findmy_rebuild_running: bool = False
         self._findmy_alignment_dirty: bool = False
+        # Monotonic stamp of the last queued alignment write, for throttling.
+        self._findmy_alignment_last_queued: float = 0.0
         # Alignment lives in its own Store. Writing it to the config entry would
         # trip the update listener and reload the integration on every sighting.
         self._findmy_store: Store[dict[str, Any]] = Store(hass, FINDMY_STORAGE_VERSION, FINDMY_STORAGE_KEY)
@@ -739,9 +742,15 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         # called by _run in events.py, so pretty sure we are "in the event loop".
                         async_dispatcher_send(self.hass, SIGNAL_DEVICE_NEW, address)
 
-            # Persist any FindMy alignment we learned this cycle (debounced).
-            if self._findmy_alignment_dirty:
+            # Persist any FindMy alignment we learned this cycle. Throttled, not
+            # merely debounced - see FINDMY_STORAGE_MIN_INTERVAL for why queueing
+            # a save every cycle means the write never actually happens.
+            if (
+                self._findmy_alignment_dirty
+                and nowstamp - self._findmy_alignment_last_queued >= FINDMY_STORAGE_MIN_INTERVAL
+            ):
                 self._findmy_alignment_dirty = False
+                self._findmy_alignment_last_queued = nowstamp
                 self.async_save_findmy_alignment()
 
             # Device Pruning (only runs periodically)

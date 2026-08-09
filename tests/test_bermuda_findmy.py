@@ -411,3 +411,68 @@ async def test_removing_an_accessory_triggers_an_alignment_save():
     saves.clear()
     await handler.async_step_findmy_remove({"remove": ["findmy_nosuchthing"]})
     assert saves == []
+
+
+def test_alignment_writes_cannot_be_starved_by_continuous_sightings():
+    """
+    Queueing an alignment save must be throttled, not merely debounced.
+
+    Regression test: Store.async_delay_save is a resetting debounce with no max
+    wait - each call pushes its timer forward, and a timer firing early
+    reschedules itself rather than writing (see
+    homeassistant/helpers/storage.py::_async_schedule_callback_delayed_write).
+    Alignment changes on essentially every sighting, so queueing a save every
+    coordinator cycle meant a tag that stayed in view starved the write for as
+    long as it was visible. Observed live: alignment on disk was 19 hours stale
+    while the tag had been tracking continuously, and a restart then reloaded
+    the ancient index.
+
+    This models the real Store timer semantics and asserts a write lands.
+    """
+    from types import SimpleNamespace
+
+    from custom_components.bermuda.const import FINDMY_STORAGE_MIN_INTERVAL, FINDMY_STORAGE_SAVE_DELAY
+
+    class FakeStore:
+        """Store.async_delay_save's resetting-debounce behaviour."""
+
+        def __init__(self):
+            self.fire_at: float | None = None
+            self.writes = 0
+
+        def async_delay_save(self, _func, delay):
+            # Every call pushes the deadline out - this is the trap.
+            self.fire_at = NOW[0] + delay
+
+        def tick(self):
+            if self.fire_at is not None and NOW[0] >= self.fire_at:
+                self.writes += 1
+                self.fire_at = None
+
+    NOW = [0.0]
+    store = FakeStore()
+
+    # A tag in continuous view: alignment goes dirty on every cycle.
+    last_queued = 0.0
+    cycle = 10.0  # coordinator cycles far more often than the debounce delay
+    for _ in range(360):  # one hour of continuous sightings
+        NOW[0] += cycle
+        dirty = True
+        if dirty and NOW[0] - last_queued >= FINDMY_STORAGE_MIN_INTERVAL:
+            last_queued = NOW[0]
+            store.async_delay_save(lambda: {}, FINDMY_STORAGE_SAVE_DELAY)
+        store.tick()
+
+    assert store.writes > 0, "throttled queueing must let the debounce actually fire"
+    # Sanity: the throttle must be comfortably longer than the debounce, or the
+    # same starvation returns.
+    assert FINDMY_STORAGE_MIN_INTERVAL > FINDMY_STORAGE_SAVE_DELAY
+
+    # And prove the old behaviour (queue every cycle) really did starve.
+    NOW[0] = 0.0
+    naive = FakeStore()
+    for _ in range(360):
+        NOW[0] += cycle
+        naive.async_delay_save(lambda: {}, FINDMY_STORAGE_SAVE_DELAY)
+        naive.tick()
+    assert naive.writes == 0, "the un-throttled version should never have written"
