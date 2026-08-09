@@ -265,3 +265,149 @@ def test_options_flow_handler_initialises_errors():
     handler = BermudaOptionsFlowHandler(entry)
 
     assert handler._errors == {}  # noqa: SLF001
+
+
+def test_identifier_fallback_does_not_expose_key_material():
+    """
+    An accessory with no identifier must not derive its address from the key.
+
+    Regression test: the fallback was hexlify(master_key[:16]), putting 16 of the
+    28 master key bytes into the metadevice address - which ends up in device
+    names, logs and diagnostics. Hashing keeps the address deterministic (so
+    re-pasting the same keys resolves to the same metadevice) without being
+    reversible into key material.
+    """
+    raw = json.loads(ACCESSORY_JSON)
+    del raw["identifier"]
+    master_key_hex = raw["master_key"]
+
+    acc = FindMyAccessoryKeys.from_json(json.dumps(raw))
+
+    assert master_key_hex[:32] not in acc.address
+    assert acc.address.startswith("findmy_")
+    # Deterministic: the same keys must not spawn a second metadevice.
+    assert FindMyAccessoryKeys.from_json(json.dumps(raw)).address == acc.address
+
+
+def test_alignment_persists_without_touching_the_config_entry():
+    """
+    Alignment must be saved to its own Store, never to the config entry.
+
+    Regression test for the reload loop: __init__ registers
+    entry.add_update_listener(async_reload_entry), so *any* config entry write
+    reloads the integration. Alignment updates on every sighting, so persisting
+    it via async_update_entry reloaded Bermuda constantly, tearing down the
+    FindMy metadevices it had just built and leaving their entities
+    permanently unavailable.
+    """
+    from types import SimpleNamespace
+
+    from custom_components.bermuda.coordinator import BermudaDataUpdateCoordinator
+
+    manager = BermudaFindMyManager()
+    acc = manager.add_accessory(_accessory())
+
+    saved: dict = {}
+
+    def _delay_save(func, delay):
+        saved["payload"] = func()
+        saved["delay"] = delay
+
+    def _explode(*_args, **_kwargs):
+        msg = "alignment must not be written to the config entry - it triggers a reload"
+        raise AssertionError(msg)
+
+    coordinator = SimpleNamespace(
+        findmy_manager=manager,
+        _findmy_store=SimpleNamespace(async_delay_save=_delay_save),
+        hass=SimpleNamespace(config_entries=SimpleNamespace(async_update_entry=_explode)),
+    )
+    coordinator._findmy_alignment_data = lambda: BermudaDataUpdateCoordinator._findmy_alignment_data(coordinator)  # noqa: SLF001
+
+    BermudaDataUpdateCoordinator.async_save_findmy_alignment(coordinator)
+
+    assert saved["payload"] == {
+        acc.address: {
+            "alignment_index": acc.alignment_index,
+            "alignment_date": acc.alignment_date.isoformat(),
+        }
+    }
+    # And the payload is runtime state only - no key material rides along.
+    blob = json.dumps(saved["payload"])
+    assert "00" * 28 not in blob
+    assert "11" * 32 not in blob
+    assert "22" * 32 not in blob
+
+
+def test_removed_accessory_drops_out_of_the_alignment_payload():
+    """Removing an accessory must clear it from the Store, not orphan its index."""
+    from types import SimpleNamespace
+
+    from custom_components.bermuda.coordinator import BermudaDataUpdateCoordinator
+
+    manager = BermudaFindMyManager()
+    acc = manager.add_accessory(_accessory())
+    coordinator = SimpleNamespace(findmy_manager=manager)
+
+    payload = BermudaDataUpdateCoordinator._findmy_alignment_data(coordinator)  # noqa: SLF001
+    assert acc.address in payload
+
+    manager.remove_accessory(acc.address)
+    assert BermudaDataUpdateCoordinator._findmy_alignment_data(coordinator) == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_removing_an_accessory_triggers_an_alignment_save():
+    """
+    The removal step must queue a Store save.
+
+    Regression test: the payload is rebuilt from the live accessory list, but
+    nothing else triggers a save once an accessory stops being sighted - so
+    without this call a removed accessory's alignment index lingered in
+    .storage indefinitely, forever if it was the last one.
+    """
+    from types import SimpleNamespace
+
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from custom_components.bermuda.config_flow import BermudaOptionsFlowHandler
+    from custom_components.bermuda.const import DOMAIN
+
+    manager = BermudaFindMyManager()
+    acc = manager.add_accessory(_accessory())
+
+    saves: list[bool] = []
+    coordinator = SimpleNamespace(
+        findmy_manager=manager,
+        async_save_findmy_alignment=lambda: saves.append(True),
+    )
+
+    entry = MockConfigEntry(domain=DOMAIN, data={}, options={})
+    entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    handler = BermudaOptionsFlowHandler(entry)
+    # OptionsFlow.config_entry resolves the entry by id off hass; the id comes
+    # from the flow's `handler` attribute.
+    handler.handler = entry.entry_id
+    handler.hass = SimpleNamespace(
+        config_entries=SimpleNamespace(
+            async_update_entry=lambda *a, **k: None,
+            # OptionsFlow.config_entry resolves through the manager.
+            async_get_known_entry=lambda _entry_id: entry,
+        ),
+    )
+
+    # Stop after the removal branch; the follow-on menu step needs a real flow.
+    async def _skip_menu(user_input=None):
+        return None
+
+    handler.async_step_findmy = _skip_menu
+
+    await handler.async_step_findmy_remove({"remove": [acc.address]})
+
+    assert saves == [True], "removal must queue an alignment save"
+    assert manager.accessories == {}
+
+    # A no-op removal must not churn the Store.
+    saves.clear()
+    await handler.async_step_findmy_remove({"remove": ["findmy_nosuchthing"]})
+    assert saves == []

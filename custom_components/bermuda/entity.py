@@ -11,6 +11,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_IBEACON,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
     ATTRIBUTION,
@@ -135,6 +136,12 @@ class BermudaEntity(CoordinatorEntity):
             # this "matches" what it stores for identifier.
             connections = {("ibeacon", self._device.address.lower())}
             model = f"iBeacon: {self._device.address.lower()}"
+        elif self._device.address_type == ADDR_TYPE_FINDMY:
+            # A FindMy accessory has no stable MAC, so we can't offer a bluetooth
+            # connection tuple - the address here is our own metadevice id. Use a
+            # namespaced identifier instead, the way iBeacon does.
+            connections = {("findmy", self._device.address.lower())}
+            model = "FindMy accessory"
         elif self._device.address_type == ADDR_TYPE_PRIVATE_BLE_DEVICE:
             # Private BLE Device integration doesn't specify "connection" tuples,
             # so we use what it defines for the "identifier" instead.

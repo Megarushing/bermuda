@@ -17,6 +17,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import (
     _LOGGER,
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_IBEACON,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
     SIGNAL_DEVICE_NEW,
@@ -212,6 +213,7 @@ class BermudaSensor(BermudaEntity, SensorEntity):
         if self._device.address_type in [
             ADDR_TYPE_IBEACON,
             ADDR_TYPE_PRIVATE_BLE_DEVICE,
+            ADDR_TYPE_FINDMY,
         ]:
             # Check the current sources and find the latest
             current_mac: str = STATE_UNAVAILABLE

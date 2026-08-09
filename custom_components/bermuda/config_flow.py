@@ -700,8 +700,16 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         accessories = coordinator.findmy_manager.accessories
 
         if user_input is not None:
-            for address in user_input.get("remove", []):
-                coordinator.findmy_manager.remove_accessory(address)
+            removed = [
+                address
+                for address in user_input.get("remove", [])
+                if coordinator.findmy_manager.remove_accessory(address)
+            ]
+            if removed:
+                # Drop the departed accessories from the alignment Store too, or
+                # their indices linger there indefinitely - nothing else triggers a
+                # save once an accessory stops being sighted.
+                coordinator.async_save_findmy_alignment()
             self.hass.config_entries.async_update_entry(
                 self.config_entry,
                 data={**self.config_entry.data, CONFDATA_FINDMY: coordinator.findmy_manager.dump()},

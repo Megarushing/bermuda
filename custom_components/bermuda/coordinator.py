@@ -55,11 +55,12 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.dt import get_age, now
 
 from .bermuda_device import BermudaDevice
-from .bermuda_findmy import BermudaFindMyManager
+from .bermuda_findmy import BermudaFindMyManager, FindMyMacMatch
 from .bermuda_irk import BermudaIrkManager
 from .const import (
     _LOGGER,
     _LOGGER_SPAM_LESS,
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
     AREA_MAX_AD_AGE,
     BDADDR_TYPE_NOT_MAC48,
@@ -679,9 +680,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         try:  # so we can still clean up update_in_progress
             nowstamp = monotonic_time_coarse()
 
-            # Keep the FindMy address table current before consuming adverts, so a
-            # rotation is matched on the first advert of the new MAC rather than
-            # after the next cycle.
+            # Roll the FindMy address table forward if it has aged out. This is
+            # dispatched to a background task, so it does not gate the adverts we
+            # are about to consume - a rotation is still matched immediately
+            # because FINDMY_LOOKAHEAD_INDICES puts the upcoming addresses in the
+            # table before the accessory switches to them.
             self._async_refresh_findmy_table()
 
             # The main "get all adverts from the backend" part.
@@ -1068,7 +1071,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                 pb_entity.entity_id,
                             )
 
-    def register_findmy_source(self, source_device: BermudaDevice, match) -> None:
+    def register_findmy_source(self, source_device: BermudaDevice, match: FindMyMacMatch) -> None:
         """
         Create or update the meta-device tracking a FindMy accessory.
 
@@ -1820,6 +1823,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 i += 1
                 if device.address_type == ADDR_TYPE_PRIVATE_BLE_DEVICE:
                     self.redactions[address] = f"{address[:4]}::IRK_DEV_{i}"
+                elif device.address_type == ADDR_TYPE_FINDMY:
+                    # Must be redacted explicitly: a findmy_ address matches none of
+                    # the branches below, and the catch-all echoes the address back
+                    # verbatim, which would defeat the point for a user-supplied id.
+                    self.redactions[address] = f"{address[:11]}::FINDMY_DEV_{i}"
                 elif address.count("_") == 2:
                     self.redactions[address] = f"{address[:4]}::OTHER_iBea_{i}::{address[32:]}"
                     # Raw uuid in advert

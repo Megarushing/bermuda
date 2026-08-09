@@ -27,7 +27,7 @@ beautifulsoup4 and anisette for functionality we do not use.
 
 from __future__ import annotations
 
-import binascii
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -141,9 +141,21 @@ class FindMyAccessoryKeys:
         self.model = model
         self.serial_number = serial_number
         # The metadevice address. Stable for the life of the accessory.
-        self.identifier = identifier or binascii.hexlify(master_key[:16]).decode()
-        self.alignment_date = _ensure_aware(alignment_date) if alignment_date else self.paired_at
-        self.alignment_index = alignment_index
+        #
+        # When the export doesn't carry an identifier we hash the master key rather
+        # than slicing it: the identifier ends up in device names, logs and
+        # diagnostics, so it must not be reversible into key material. Hashing keeps
+        # it deterministic, so re-pasting the same keys still resolves to the same
+        # metadevice instead of spawning a duplicate.
+        self.identifier = identifier or hashlib.sha256(master_key).hexdigest()[:32]
+
+        # Alignment is a single (date, index) fact and is read from the executor
+        # thread while the event loop may be updating it - see update_alignment().
+        # Keeping it in one tuple makes each read see a consistent pair.
+        self._alignment: tuple[datetime, int] = (
+            _ensure_aware(alignment_date) if alignment_date else self.paired_at,
+            alignment_index,
+        )
 
         # SK chain state. The chain is strictly sequential - sk[n] derives from
         # sk[n-1] - and an accessory paired years ago can be 180,000+ steps along
@@ -152,6 +164,16 @@ class FindMyAccessoryKeys:
         self._sk_head: dict[bool, tuple[int, bytes]] = {False: (0, skn), True: (0, sks)}
         self._sk_checkpoints: dict[bool, dict[int, bytes]] = {False: {0: skn}, True: {0: sks}}
         self._mac_cache: dict[tuple[int, str], str] = {}
+
+    @property
+    def alignment_date(self) -> datetime:
+        """When we last confirmed this accessory's position in its key schedule."""
+        return self._alignment[0]
+
+    @property
+    def alignment_index(self) -> int:
+        """The key index we last confirmed this accessory was using."""
+        return self._alignment[1]
 
     @property
     def address(self) -> str:
@@ -171,9 +193,10 @@ class FindMyAccessoryKeys:
         accessory may have rolled more slowly, or not at all if powered off.
         """
         now = now or datetime.now(UTC)
-        if now <= self.alignment_date:
-            return self.alignment_index
-        return self.alignment_index + int((now - self.alignment_date) // FINDMY_KEY_INTERVAL)
+        align_date, align_index = self._alignment
+        if now <= align_date:
+            return align_index
+        return align_index + int((now - align_date) // FINDMY_KEY_INTERVAL)
 
     def index_window(self, now: datetime | None = None) -> tuple[int, int]:
         """
@@ -186,7 +209,7 @@ class FindMyAccessoryKeys:
         window via update_alignment().
         """
         top = self.max_index(now) + FINDMY_LOOKAHEAD_INDICES
-        bottom = max(self.alignment_index, top - FINDMY_MAX_UNALIGNED_INDICES)
+        bottom = max(self._alignment[1], top - FINDMY_MAX_UNALIGNED_INDICES)
         return bottom, top
 
     def _sk_at(self, ind: int, *, secondary: bool) -> bytes:
@@ -266,20 +289,23 @@ class FindMyAccessoryKeys:
         Ignores anything that moves backwards, since we may be handed conflicting
         observations and a stable, most-recent value is what we want.
         Returns True if the alignment changed (ie, worth persisting).
+
+        Called from the event loop while the executor thread may be reading the
+        alignment, so the update is published as a single tuple assignment.
         """
         seen_at = _ensure_aware(seen_at)
-        if seen_at < self.alignment_date or index < self.alignment_index:
+        current_date, current_index = self._alignment
+        if seen_at < current_date or index < current_index:
             return False
-        if index == self.alignment_index and seen_at == self.alignment_date:
+        if index == current_index and seen_at == current_date:
             return False
         _LOGGER.debug(
             "FindMy %s: alignment updated to index %d (was %d)",
             self.friendly_name,
             index,
-            self.alignment_index,
+            current_index,
         )
-        self.alignment_date = seen_at
-        self.alignment_index = index
+        self._alignment = (seen_at, index)
         return True
 
     def to_dict(self) -> dict[str, Any]:
