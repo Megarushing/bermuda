@@ -476,3 +476,46 @@ def test_alignment_writes_cannot_be_starved_by_continuous_sightings():
         naive.async_delay_save(lambda: {}, FINDMY_STORAGE_SAVE_DELAY)
         naive.tick()
     assert naive.writes == 0, "the un-throttled version should never have written"
+
+
+def test_stale_alignment_cannot_lock_an_accessory_out():
+    """
+    A too-low alignment anchor must not put the real key index out of reach.
+
+    Regression test, from a live lockout. Write starvation left an accessory's
+    stored alignment at index 204 / 2026-08-08T19:25 while its real index had
+    reached 299. A restart reloaded that stale anchor, and index_window()
+    derived its ceiling purely from it: 204 + 78 elapsed + 2 = 284. The real
+    index sat 15 above the ceiling, so no advert could ever match, and because
+    update_alignment() refuses to move backwards nothing could raise the ceiling
+    again - the accessory was locked out permanently.
+
+    The pairing time is an independent, always-valid upper bound.
+    """
+    raw = json.loads(ACCESSORY_JSON)
+    # Paired ~3 days before "now", which is where the real index comes from.
+    paired = datetime(2026, 8, 6, 11, 45, tzinfo=UTC)
+    raw["paired_at"] = paired.isoformat()
+    raw["alignment_date"] = paired.isoformat()
+    raw["alignment_index"] = 0
+    acc = FindMyAccessoryKeys.from_json(json.dumps(raw))
+
+    now = datetime(2026, 8, 9, 15, 0, tzinfo=UTC)
+    real_index = int((now - paired) // timedelta(minutes=15))  # ~301
+
+    # The stale anchor that caused the lockout.
+    acc._alignment = (datetime(2026, 8, 8, 19, 25, tzinfo=UTC), 204)  # noqa: SLF001
+
+    bottom, top = acc.index_window(now)
+    assert top >= real_index, f"ceiling {top} must still reach the real index {real_index}"
+    assert bottom <= real_index
+
+    # The accessory must actually be findable at its real index.
+    manager = BermudaFindMyManager()
+    manager.add_accessory(acc)
+    manager.build_table(now)
+    assert manager.check_mac(acc._mac_at(real_index, KEY_TYPE_PRIMARY)) is not None  # noqa: SLF001
+
+    # And a fresh, correct alignment must still win when it is ahead of pairing.
+    acc._alignment = (now, real_index + 40)  # noqa: SLF001
+    assert acc.max_index(now) == real_index + 40

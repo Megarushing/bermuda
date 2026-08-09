@@ -191,12 +191,24 @@ class FindMyAccessoryKeys:
 
         The key rolls at most once per interval, so this is an upper bound - the
         accessory may have rolled more slowly, or not at all if powered off.
+
+        Derived from the pairing time as well as from the last confirmed sighting,
+        taking whichever is higher. Anchoring solely on the alignment is a trap: if
+        the stored alignment is ever too low - a stale value reloaded from the Store,
+        say - the ceiling is too low with it, the accessory's real index climbs past
+        it, and because update_alignment() never moves backwards nothing can raise
+        the ceiling again. That locks the accessory out permanently. The pairing
+        time is fixed and independent, so it always offers a valid upper bound.
         """
         now = now or datetime.now(UTC)
         align_date, align_index = self._alignment
-        if now <= align_date:
-            return align_index
-        return align_index + int((now - align_date) // FINDMY_KEY_INTERVAL)
+        from_alignment = align_index
+        if now > align_date:
+            from_alignment = align_index + int((now - align_date) // FINDMY_KEY_INTERVAL)
+        from_pairing = 0
+        if now > self.paired_at:
+            from_pairing = int((now - self.paired_at) // FINDMY_KEY_INTERVAL)
+        return max(from_alignment, from_pairing)
 
     def index_window(self, now: datetime | None = None) -> tuple[int, int]:
         """
